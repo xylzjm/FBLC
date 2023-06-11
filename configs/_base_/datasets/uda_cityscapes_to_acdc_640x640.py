@@ -1,6 +1,6 @@
 # dataset settings
 dataset_type = 'ACDCDataset'
-data_root = 'data/acdc/'
+data_root = '/hy-tmp/data/acdc/'
 img_norm_cfg = dict(
     mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
 crop_size = (640, 640)
@@ -52,53 +52,28 @@ data = dict(
         type='UDADataset',
         source=dict(
             type='CityscapesDataset',
-            data_root='data/cityscapes/',
+            data_root='/hy-tmp/data/cityscapes/',
             img_dir='leftImg8bit/train',
             ann_dir='gtFine/train',
             pipeline=cityscapes_train_pipeline),
         target=dict(
             type='ACDCDataset',
-            data_root='data/acdc/',
-            img_dir=[
-                'rgb_anon/fog/train',
-                'rgb_anon/night/train',
-                'rgb_anon/rain/train',
-                'rgb_anon/snow/train',
-            ],
-            ann_dir=[
-                'gt/fog/train',
-                'gt/night/train',
-                'gt/rain/train',
-                'gt/snow/train',
-            ],
+            data_root='/hy-tmp/data/acdc/',
+            img_dir='rgb_anon/train',
+            ann_dir='gt/train',
             pipeline=acdc_train_pipeline)),
     val=dict(
         type='ACDCDataset',
-        data_root='data/acdc/',
-        img_dir=[
-            'rgb_anon/fog/val',
-            'rgb_anon/night/val',
-            'rgb_anon/rain/val',
-            'rgb_anon/snow/val',
-        ],
-        ann_dir=[
-            'gt/fog/val',
-            'gt/night/val',
-            'gt/rain/val',
-            'gt/snow/val',
-        ],
-        separate_eval=False,
+        data_root='/hy-tmp/data/acdc/',
+        img_dir='rgb_anon/val',
+        ann_dir='gt/val',
+        # separate_eval=False,
         pipeline=test_pipeline),
     test=dict(
         type='ACDCDataset',
-        data_root='data/acdc/',
-        img_dir=[
-            'rgb_anon/fog/test',
-            'rgb_anon/night/test',
-            'rgb_anon/rain/test',
-            'rgb_anon/snow/test',
-        ],
-        separate_eval=False,
+        data_root='/hy-tmp/data/acdc/',
+        img_dir='rgb_anon/test',
+        # separate_eval=False,
         test_mode=True,
         pipeline=test_pipeline)
 )

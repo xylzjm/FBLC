@@ -73,7 +73,7 @@ if __name__ == '__main__':
         child_cfg = {
             '_base_': args.config.replace('configs', '../..'),
             'name': unique_name,
-            'work_dir': os.path.join('work_dirs', exp_name, unique_name),
+            'work_dir': os.path.join('/hy-tmp/result', exp_name, unique_name),
             'git_rev': get_git_hash()
         }
         cfg_out_file = f"{GEN_CONFIG_DIR}/{exp_name}/{child_cfg['name']}.json"
@@ -100,7 +100,7 @@ if __name__ == '__main__':
             # Generate Config File
             cfg['name'] = f'{datetime.now().strftime("%y%m%d_%H%M")}_' \
                           f'{cfg["name"]}_{str(uuid.uuid4())[:5]}'
-            cfg['work_dir'] = os.path.join('work_dirs', exp_name, cfg['name'])
+            cfg['work_dir'] = os.path.join('/hy-tmp/result', exp_name, cfg['name'])
             cfg['git_rev'] = get_git_hash()
             cfg['_base_'] = ['../../' + e for e in cfg['_base_']]
             cfg_out_file = f"{GEN_CONFIG_DIR}/{exp_name}/{cfg['name']}.json"
@@ -115,5 +115,6 @@ if __name__ == '__main__':
             print('Run job {}'.format(cfg['name']))
             train.main([config_files[i]])
             torch.cuda.empty_cache()
+            os.system('/root/upload.sh')
     else:
         raise NotImplementedError(args.machine)

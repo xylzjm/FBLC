@@ -9,7 +9,7 @@ import torch.nn as nn
 
 
 def strong_transform(param, data=None, target=None):
-    assert ((data is not None) or (target is not None))
+    assert (data is not None) or (target is not None)
     data, target = one_mix(mask=param['mix'], data=data, target=target)
     data, target = color_jitter(
         color_jitter=param['color_jitter'],
@@ -18,7 +18,8 @@ def strong_transform(param, data=None, target=None):
         mean=param['mean'],
         std=param['std'],
         data=data,
-        target=target)
+        target=target,
+    )
     data, target = gaussian_blur(blur=param['blur'], data=data, target=target)
     return data, target
 
@@ -49,7 +50,7 @@ def renorm_(img, mean, std):
     img.mul_(255.0).sub_(mean).div_(std)
 
 
-def color_jitter(color_jitter, mean, std, data=None, target=None, s=.25, p=.2):
+def color_jitter(color_jitter, mean, std, data=None, target=None, s=0.25, p=0.2):
     # s is the strength of colorjitter
     if not (data is None):
         if data.shape[1] == 3:
@@ -59,7 +60,9 @@ def color_jitter(color_jitter, mean, std, data=None, target=None, s=.25, p=.2):
                 else:
                     seq = nn.Sequential(
                         kornia.augmentation.ColorJitter(
-                            brightness=s, contrast=s, saturation=s, hue=s))
+                            brightness=s, contrast=s, saturation=s, hue=s
+                        )
+                    )
                 denorm_(data, mean, std)
                 data = seq(data)
                 renorm_(data, mean, std)
@@ -73,16 +76,24 @@ def gaussian_blur(blur, data=None, target=None):
                 sigma = np.random.uniform(0.15, 1.15)
                 kernel_size_y = int(
                     np.floor(
-                        np.ceil(0.1 * data.shape[2]) - 0.5 +
-                        np.ceil(0.1 * data.shape[2]) % 2))
+                        np.ceil(0.1 * data.shape[2])
+                        - 0.5
+                        + np.ceil(0.1 * data.shape[2]) % 2
+                    )
+                )
                 kernel_size_x = int(
                     np.floor(
-                        np.ceil(0.1 * data.shape[3]) - 0.5 +
-                        np.ceil(0.1 * data.shape[3]) % 2))
+                        np.ceil(0.1 * data.shape[3])
+                        - 0.5
+                        + np.ceil(0.1 * data.shape[3]) % 2
+                    )
+                )
                 kernel_size = (kernel_size_y, kernel_size_x)
                 seq = nn.Sequential(
                     kornia.filters.GaussianBlur2d(
-                        kernel_size=kernel_size, sigma=(sigma, sigma)))
+                        kernel_size=kernel_size, sigma=(sigma, sigma)
+                    )
+                )
                 data = seq(data)
     return data, target
 
@@ -93,15 +104,15 @@ def get_class_masks(labels):
         classes = torch.unique(labels)
         nclasses = classes.shape[0]
         class_choice = np.random.choice(
-            nclasses, int((nclasses + nclasses % 2) / 2), replace=False)
+            nclasses, int((nclasses + nclasses % 2) / 2), replace=False
+        )
         classes = classes[torch.Tensor(class_choice).long()]
         class_masks.append(generate_class_mask(label, classes).unsqueeze(0))
     return class_masks
 
 
 def generate_class_mask(label, classes):
-    label, classes = torch.broadcast_tensors(label,
-                                             classes.unsqueeze(1).unsqueeze(2))
+    label, classes = torch.broadcast_tensors(label, classes.unsqueeze(1).unsqueeze(2))
     class_mask = label.eq(classes).sum(0, keepdims=True)
     return class_mask
 
@@ -111,10 +122,8 @@ def one_mix(mask, data=None, target=None):
         return data, target
     if not (data is None):
         stackedMask0, _ = torch.broadcast_tensors(mask[0], data[0])
-        data = (stackedMask0 * data[0] +
-                (1 - stackedMask0) * data[1]).unsqueeze(0)
+        data = (stackedMask0 * data[0] + (1 - stackedMask0) * data[1]).unsqueeze(0)
     if not (target is None):
         stackedMask0, _ = torch.broadcast_tensors(mask[0], target[0])
-        target = (stackedMask0 * target[0] +
-                  (1 - stackedMask0) * target[1]).unsqueeze(0)
+        target = (stackedMask0 * target[0] + (1 - stackedMask0) * target[1]).unsqueeze(0)
     return data, target
