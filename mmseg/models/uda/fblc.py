@@ -141,24 +141,24 @@ class FBLC(UDADecorator):
         )
 
         # illumination boost image
-        night_map = []
+        """ night_map = []
         for meta in tgt_img_metas:
             if 'night' in meta['filename']:
                 night_map.append(1)
             else:
                 night_map.append(0)
-        tgt_ib_img = night_fog_filter(tgt_img, means, stds, night_map, mode='hsv-s-w4')
+        tgt_ib_img = night_fog_filter(tgt_img, means, stds, night_map, mode='hsv-s-w4') """
 
         # Fourier amplitude transform
         tgt_fb_img = [None] * batch_size
         for i in range(batch_size):
             tgt_fb_img[i] = fourier_transform(
-                data=torch.stack((tgt_ib_img[i], src_img[i])),
+                data=torch.stack((tgt_img[i], src_img[i])),
                 mean=means[0].unsqueeze(0),
                 std=stds[0].unsqueeze(0),
             )
         tgt_fb_img = torch.cat(tgt_fb_img)
-        del tgt_ib_img
+        # del tgt_ib_img
 
         # train main model with source
         src_losses = self.get_model().forward_train(
