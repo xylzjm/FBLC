@@ -11,7 +11,9 @@ import matplotlib.pyplot as plt
 from timm.models.layers import DropPath
 from torch.nn.modules.dropout import _DropoutNd
 import torch
+import mmcv
 import numpy as np
+import torch.nn.functional as F
 
 from mmseg.core import add_prefix
 from mmseg.models import UDA, build_segmentor
@@ -26,6 +28,35 @@ from mmseg.models.utils.dacs_transforms import (
 from mmseg.models.utils.night_fog_filter import night_fog_filter
 from mmseg.models.utils.fourier_transforms import fourier_transform
 from mmseg.models.utils.visualization import subplotimg
+from mmseg.datasets.pipelines import Compose
+from mmcv.parallel import collate, scatter
+
+
+class LoadImage:
+    """A simple pipeline to load image."""
+
+    def __call__(self, results):
+        """Call function to load images into results.
+
+        Args:
+            results (dict): A result dict contains the file name
+                of the image to be read.
+
+        Returns:
+            dict: ``results`` will be returned containing loaded image.
+        """
+
+        if isinstance(results['img'], str):
+            results['filename'] = results['img']
+            results['ori_filename'] = results['img']
+        else:
+            results['filename'] = None
+            results['ori_filename'] = None
+        img = mmcv.imread(results['img'])
+        results['img'] = img
+        results['img_shape'] = img.shape
+        results['ori_shape'] = img.shape
+        return results
 
 
 @UDA.register_module()
@@ -44,11 +75,31 @@ class FBLC(UDADecorator):
         self.color_jitter_s = cfg.get('color_jitter_strength', 0.2)
         self.color_jitter_p = cfg.get('color_jitter_probability', 0.2)
 
-        ema_cfg = deepcopy(cfg['model'])
+        img_norm_cfg = dict(
+            mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True
+        )
+        self.add_pipeline = [LoadImage()] + [
+            dict(type='Resize', img_scale=(1280, 720)),
+            dict(type='RandomFlip', prob=0.0),
+            dict(type='Normalize', **img_norm_cfg),
+            dict(type='DefaultFormatBundle'),
+            dict(type='Collect', keys=['img']),
+        ]
+
+        self.proto_vectors = torch.zeros(
+            [self.num_classes, self.get_model().decode_head.channels]
+        )
+        self.proto_vectors_num = torch.zeros([self.num_classes])
+
+        ema_cfg, fix_cfg = deepcopy(cfg['model']), deepcopy(cfg['model'])
         self.ema_model = build_segmentor(ema_cfg)
+        self.fix_model = build_segmentor(fix_cfg)
 
     def get_ema_model(self):
         return get_module(self.ema_model)
+
+    def get_fix_model(self):
+        return get_module(self.fix_model)
 
     def _init_ema_weights(self):
         for param in self.get_ema_model().parameters():
@@ -75,6 +126,129 @@ class FBLC(UDADecorator):
                     alpha_teacher * ema_param[:].data[:]
                     + (1 - alpha_teacher) * param[:].data[:]
                 )
+
+    def load_add_img(self, batch_size, img_metas, dev):
+        add_pipeline = Compose(self.add_pipeline)
+        add_data = [None] * batch_size
+        for i, meta in enumerate(img_metas):
+            add_data[i] = dict(img=meta['filename'])
+            add_data[i] = add_pipeline(add_data[i])
+        add_data = collate(add_data, samples_per_gpu=batch_size)
+        add_data = scatter(add_data, [dev])[0]
+        return add_data
+
+    def setup_aux_model(self, cur_iter):
+        if cur_iter == 0:
+            self._init_ema_weights()
+            # assert _params_equal(self.get_ema_model(), self.get_model())
+        if cur_iter > 0:
+            self._update_ema(cur_iter)
+            # assert not _params_equal(self.get_ema_model(), self.get_model())
+            # assert self.get_ema_model().training
+
+        for m in self.get_ema_model().modules():
+            if isinstance(m, _DropoutNd):
+                m.training = False
+            if isinstance(m, DropPath):
+                m.training = False
+        for m in self.get_fix_model().modules():
+            if isinstance(m, _DropoutNd):
+                m.training = False
+            if isinstance(m, DropPath):
+                m.training = False
+
+    def apply_fourier_boost(self, param):
+        night_map = []
+        for meta in param['tgt_metas']:
+            if 'night' in meta['filename']:
+                night_map.append(1)
+            else:
+                night_map.append(0)
+        tgt_ib_img = night_fog_filter(
+            param['tgt_img'], param['means'], param['stds'], night_map, mode='hsv-s-w4'
+        )
+
+        # Fourier amplitude transform
+        tgt_fb_img = [None] * param['bs']
+        for i in range(param['bs']):
+            tgt_fb_img[i] = fourier_transform(
+                data=torch.stack((tgt_ib_img[i], param['src_img'][i])),
+                mean=param['means'][0].unsqueeze(0),
+                std=param['stds'][0].unsqueeze(0),
+            )
+        tgt_fb_img = torch.cat(tgt_fb_img)
+        return tgt_fb_img
+
+    def _init_proto_vectors(self, dev):
+        self.proto_vectors = torch.load('pretrained/prototype.pth').to(dev)
+
+    def _calc_mean_vector(self, batch_size, feat, logits):
+        seg_softmax = torch.softmax(logits, dim=1)
+        seg_argmax = torch.argmax(seg_softmax, dim=1)
+        label_onehot = F.one_hot(
+            seg_argmax.long(), num_classes=self.num_classes + 1
+        ).permute(0, 3, 1, 2)
+
+        scale_factor = F.adaptive_avg_pool2d(label_onehot.float(), output_size=1)
+        vectors = [{}] * batch_size
+        for b in range(batch_size):
+            for k in range(self.num_classes):
+                if scale_factor[b][k].item() == 0:
+                    continue
+                if (label_onehot[b][k] > 0).sum() < 10:
+                    continue
+                s = feat[b] * label_onehot[b][k]
+                s = F.adaptive_avg_pool2d(s, output_size=1) / scale_factor[b][k]
+                vectors[b].update({k: s.detach()})
+
+        return vectors
+
+    def _update_proto_vectors(
+        self, vectors, cur_iter=None, update_mode='moving_average'
+    ):
+        assert update_mode in ['mean', 'moving_average']
+        if update_mode == 'moving_average':
+            assert cur_iter is not None
+
+        for _k, _vector in vectors.items():
+            if _vector.sum().item() == 0:
+                continue
+            if update_mode == 'mean':
+                self.proto_vectors[_k] = (
+                    self.proto_vectors[_k] * self.proto_vectors_num[_k]
+                    + _vector.squeeze()
+                )
+                self.proto_vectors_num[_k] += 1
+                self.proto_vectors[_k] = (
+                    self.proto_vectors[_k] / self.proto_vectors_num[_k]
+                )
+                self.proto_vectors_num[_k] = min(self.proto_vectors_num[_k], 3000)
+            if update_mode == 'moving_average':
+                alpha = min(1 - 1 / (cur_iter + 1), self.alpha)
+                self.proto_vectors[_k] = (
+                    alpha * self.proto_vectors[_k] + (1 - alpha) * _vector.squeeze()
+                )
+                self.proto_vectors_num[_k] += 1
+                self.proto_vectors_num[_k] = min(self.proto_vectors_num[_k], 3000)
+
+    def feat_prototype_distance(self, feat):
+        b, c, h, w = feat.shape
+        feat_proto_dis = -torch.ones((b, self.num_classes, h, w)).to(feat.device)
+        for i in range(self.num_classes):
+            feat_proto_dis[:, i, :, :] = torch.norm(
+                self.proto_vectors[i].reshape(-1, 1, 1).expand(-1, h, w) - feat,
+                p=2,
+                dim=1,
+            )
+        return feat_proto_dis
+
+    def calc_proto_rectify_weight(self, feat):
+        feat_proto_dis = self.feat_prototype_distance(feat)
+        feat_nearest_proto_dis, _ = feat_proto_dis.min(dim=1, keepdim=True)
+
+        feat_proto_dis = feat_proto_dis - feat_nearest_proto_dis
+        weight = torch.softmax(-feat_proto_dis, dim=1)
+        return weight
 
     def train_step(self, data_batch, optimizer, **kwargs):
         """The iteration step during training.
@@ -117,22 +291,6 @@ class FBLC(UDADecorator):
         dev = img[0][0].device
         means, stds = get_mean_std(img_metas[0][0], dev)
 
-        # Init/update ema model
-        if self.local_iter == 0:
-            self._init_ema_weights()
-            # assert _params_equal(self.get_ema_model(), self.get_model())
-
-        if self.local_iter > 0:
-            self._update_ema(self.local_iter)
-            # assert not _params_equal(self.get_ema_model(), self.get_model())
-            # assert self.get_ema_model().training
-
-        for m in self.get_ema_model().modules():
-            if isinstance(m, _DropoutNd):
-                m.training = False
-            if isinstance(m, DropPath):
-                m.training = False
-
         src_img, tgt_img = img[0][0], img[1][0]
         src_img_metas, tgt_img_metas = img_metas[0][0], img_metas[1][0]
         src_gt_semantic_seg, tgt_gt_semantic_seg = (
@@ -140,25 +298,32 @@ class FBLC(UDADecorator):
             gt_semantic_seg[1][0],
         )
 
-        # illumination boost image
-        """ night_map = []
-        for meta in tgt_img_metas:
-            if 'night' in meta['filename']:
-                night_map.append(1)
-            else:
-                night_map.append(0)
-        tgt_ib_img = night_fog_filter(tgt_img, means, stds, night_map, mode='hsv-s-w4') """
+        # Init/update aux model
+        self.setup_aux_model(self.local_iter)
 
-        # Fourier amplitude transform
-        tgt_fb_img = [None] * batch_size
-        for i in range(batch_size):
-            tgt_fb_img[i] = fourier_transform(
-                data=torch.stack((tgt_img[i], src_img[i])),
-                mean=means[0].unsqueeze(0),
-                std=stds[0].unsqueeze(0),
+        # Init/update proto vector
+        if self.local_iter == 0:
+            self._init_proto_vectors(dev)
+        if self.local_iter > 0:
+            add_data = self.load_add_img(batch_size, tgt_img_metas, dev)
+            add_out = self.get_ema_model().encode_decode_with_feat(**add_data)
+            vectors = self._calc_mean_vector(
+                batch_size, add_out['feature'].detach(), add_out['out'].detach()
             )
-        tgt_fb_img = torch.cat(tgt_fb_img)
-        # del tgt_ib_img
+            self._update_proto_vectors(
+                vectors, self.local_iter, update_mode='moving_average'
+            )
+
+        # illumination boost image
+        boost_parameters = {
+            'bs': batch_size,
+            'tgt_metas': tgt_img_metas,
+            'tgt_img': tgt_img,
+            'src_img': src_img,
+            'means': means,
+            'stds': stds,
+        }
+        tgt_fb_img = self.apply_fourier_boost(boost_parameters)
 
         # train main model with source
         src_losses = self.get_model().forward_train(
@@ -169,9 +334,15 @@ class FBLC(UDADecorator):
         src_loss.backward()
 
         # generate target pseudo label from aux model
-        tgt_logits = self.get_ema_model().encode_decode(tgt_fb_img, tgt_img_metas)
-        tgt_softmax = torch.softmax(tgt_logits.detach(), dim=1)
-        tgt_prob, pseudo_label = torch.max(tgt_softmax, dim=1)
+        tgt_fix_logits = self.get_fix_model().encode_decode(tgt_fb_img, tgt_img_metas)
+        tgt_fix_softmax = torch.softmax(tgt_fix_logits.detach(), dim=1)
+        tgt_ema_decode_feat = self.get_ema_model().extract_decode_feat(tgt_fb_img)
+        proto_weight = self.calc_proto_rectify_weight(tgt_ema_decode_feat.detach())
+        tgt_rectify_softmax = proto_weight * tgt_fix_softmax
+        tgt_rectify_softmax = tgt_rectify_softmax / tgt_rectify_softmax.sum(
+            dim=1, keepdim=True
+        )
+        tgt_prob, pseudo_label = torch.max(tgt_rectify_softmax, dim=1)
         tgt_pseudo_mask = tgt_prob.ge(self.pseudo_threshold).long() == 1
         ps_size = np.size(np.array(pseudo_label.cpu()))
         pseudo_weight = torch.sum(tgt_pseudo_mask).item() / ps_size
@@ -242,7 +413,7 @@ class FBLC(UDADecorator):
             vis_tgt_fb_img = torch.clamp(denorm(tgt_fb_img, means, stds), 0, 1)
             vis_mix_fb_img = torch.clamp(denorm(mixed_fb_img, means, stds), 0, 1)
             with torch.no_grad():
-                # source pseudo label
+                # source predict label
                 src_logits = self.get_model().encode_decode(src_img, src_img_metas)
                 src_softmax = torch.softmax(src_logits.detach(), dim=1)
                 _, src_pseudo_label = torch.max(src_softmax, dim=1)
@@ -252,12 +423,12 @@ class FBLC(UDADecorator):
                 src_softmax = torch.softmax(src_logits.detach(), dim=1)
                 _, src_ema_label = torch.max(src_softmax, dim=1)
                 src_ema_label = src_ema_label.unsqueeze(1)
-                # target pseudo label
+                # target predict label
                 tgt_logits = self.get_model().encode_decode(tgt_img, tgt_img_metas)
                 tgt_softmax = torch.softmax(tgt_logits.detach(), dim=1)
                 _, tgt_pseudo_label = torch.max(tgt_softmax, dim=1)
                 tgt_pseudo_label = tgt_pseudo_label.unsqueeze(1)
-                # target fb label
+                # target fb predict label
                 tgt_logits = self.get_model().encode_decode(tgt_fb_img, tgt_img_metas)
                 tgt_softmax = torch.softmax(tgt_logits.detach(), dim=1)
                 _, tgt_fb_label = torch.max(tgt_softmax, dim=1)

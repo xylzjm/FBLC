@@ -73,6 +73,17 @@ class EncoderDecoder(BaseSegmentor):
         if self.with_neck:
             x = self.neck(x)
         return x
+    
+    def extract_decode_feat(self, img):
+        """Extract decode features from images."""
+        x = self.backbone(img)
+        out = self._decode_head_forward_test(x, None, return_feat=True)['feature']
+        out = resize(
+            input=out,
+            size=img.shape[2:],
+            mode='bilinear',
+            align_corners=self.align_corners)
+        return out
 
     def extract_semantic_aware_feat(self, img, gt_semantic_seg):
         x = self.backbone(img, gt_semantic_seg)
@@ -92,6 +103,20 @@ class EncoderDecoder(BaseSegmentor):
             align_corners=self.align_corners)
         return out
 
+    def encode_decode_with_feat(self, img, img_metas):
+        """Encode images with backbone and decode into a semantic segmentation
+        map with features of the same size as input."""
+        x = self.extract_feat(img)
+        out = self._decode_head_forward_test(x, img_metas, return_feat=True)
+        for _k in out.keys():
+            out[_k] = resize(
+                input=out[_k],
+                size=img.shape[2:],
+                mode='bilinear',
+                align_corners=self.align_corners)
+        return out
+
+    
     def _decode_head_forward_train(self, x, img_metas, gt_semantic_seg, seg_weight=None, **kwargs):
         """Run forward function and calculate loss for decode head in
         training."""
@@ -105,13 +130,10 @@ class EncoderDecoder(BaseSegmentor):
         losses.update(add_prefix(loss_decode, 'decode'))
         return losses
 
-    def _decode_head_forward_test(self, x, img_metas):
+    def _decode_head_forward_test(self, x, img_metas, return_feat=False):
         """Run forward function and calculate loss for decode head in
         inference."""
-        seg_logits = self.decode_head.forward_test(x, img_metas, self.test_cfg)
-        if isinstance(seg_logits, dict):
-            seg_logits = seg_logits['out']
-        return seg_logits
+        return self.decode_head.forward_test(x, img_metas, self.test_cfg, return_feat)
 
     def _auxiliary_head_forward_train(self, x, img_metas, gt_semantic_seg):
         """Run forward function and calculate loss for auxiliary head in
